@@ -3,7 +3,6 @@ const cheerio = require('cheerio');
 
 const BASE_URL = 'https://ds.alooytv16.xyz';
 
-// هيدرز مهمة جداً لتجنب الحظر
 const HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Referer': BASE_URL + '/',
@@ -11,149 +10,245 @@ const HEADERS = {
     'Accept-Language': 'ar,en;q=0.9'
 };
 
-// 1. تحويل IMDb ID إلى عنوان باستخدام OMDb API
-async function imdbToTitle(imdbId) {
-    const apiKey = process.env.OMDB_API_KEY; // لازم تضيفه في Vercel Env Variables
-    const url = `https://www.omdbapi.com/?i=${imdbId}&apikey=${apiKey}`;
-    const { data } = await axios.get(url);
-    if (data.Response === 'False') throw new Error('OMDb: ' + data.Error);
-    return { title: data.Title, year: data.Year, type: data.Type };
+// ============================================================
+// 1. جلب العنوان من Cinemeta (بدون API key)
+// ============================================================
+async function getTitleFromImdb(imdbId, type) {
+    const url = `https://v3-cinemeta.strem.io/meta/${type}/${imdbId}.json`;
+    const { data } = await axios.get(url, { timeout: 5000 });
+    if (!data?.meta) throw new Error('Cinemeta: ما لقيت العمل');
+    return {
+        title: data.meta.name,
+        originalTitle: data.meta.originalName || data.meta.name,
+        year: data.meta.year
+    };
 }
 
-// 2. البحث في الموقع عبر autocompleteajax
-async function searchSite(query) {
-    const url = `${BASE_URL}/home/autocompleteajax?term=${encodeURIComponent(query)}`;
-    const { data } = await axios.get(url, { headers: HEADERS });
-    // data عبارة عن مصفوفة JSON
+// ============================================================
+// 2. البحث في الموقع
+// ============================================================
+async function searchSite(term) {
+    const url = `${BASE_URL}/home/autocompleteajax?term=${encodeURIComponent(term)}`;
+    const { data } = await axios.get(url, { headers: HEADERS, timeout: 6000 });
     return Array.isArray(data) ? data : [];
 }
 
-// 3. استخراج رابط الفيديو المباشر من صفحة الحلقة
-async function extractVideoUrl(pageUrl) {
-    const { data } = await axios.get(pageUrl, { headers: HEADERS });
-    const $ = cheerio.load(data);
-    
-    // نجرب أولاً وسم video > source
-    let src = $('video source').first().attr('src');
-    
-    // إذا ما لقينا، نجرب video نفسه
-    if (!src) src = $('video').attr('src');
-    
-    // إذا ما لقينا، نبحث عن أي رابط ينتهي بـ .mp4 في الكود
-    if (!src) {
-        const match = data.match(/https?:\/\/[^\s"']+\.mp4/);
-        if (match) src = match[0];
+// ============================================================
+// 3. البحث الذكي (إنجليزي → عربي → مختصر)
+// ============================================================
+async function findContent(imdbId, type) {
+    const { title, originalTitle } = await getTitleFromImdb(imdbId, type);
+    console.log(`🎬 العنوان: ${title} / ${originalTitle}`);
+
+    let results = await searchSite(title);
+    console.log(`🔍 بحث "${title}": ${results.length} نتيجة`);
+
+    if (results.length === 0 && originalTitle !== title) {
+        results = await searchSite(originalTitle);
+        console.log(`🔍 بحث "${originalTitle}": ${results.length} نتيجة`);
     }
-    
-    if (!src) return null;
-    
-    // التأكد من أن الرابط مطلق
-    if (src.startsWith('//')) src = 'https:' + src;
-    if (src.startsWith('/')) src = BASE_URL + src;
-    
-    return src;
+
+    if (results.length === 0) {
+        const short = title.split(' ').slice(0, 2).join(' ');
+        results = await searchSite(short);
+        console.log(`🔍 بحث "${short}": ${results.length} نتيجة`);
+    }
+
+    return results;
 }
 
-// 4. استخراج قائمة الحلقات من صفحة المسلسل
+// ============================================================
+// 4. استخراج الحلقات من صفحة المسلسل
+// ============================================================
 async function extractEpisodes(seriesUrl) {
-    const { data } = await axios.get(seriesUrl, { headers: HEADERS });
+    const { data } = await axios.get(seriesUrl, { headers: HEADERS, timeout: 8000 });
     const $ = cheerio.load(data);
-    
     const episodes = [];
-    
-    // نلف على كل المواسم
+
+    // كل <div class="season"> يحتوي على مجموعة حلقات
     $('.season').each((seasonIdx, seasonEl) => {
-        const seasonTitle = $(seasonEl).find('.movie-heading span').text().trim();
-        
-        // نلف على روابط الحلقات داخل هذا الموسم
-        $(seasonEl).find('a.btn-ep, a.btn-primary').each((epIdx, epEl) => {
+        $(seasonEl).find('a').each((epIdx, epEl) => {
             const href = $(epEl).attr('href');
-            const label = $(epEl).text().trim(); // مثلاً "Ep#1"
-            
-            if (href) {
-                const epNumber = parseInt(label.replace(/\D/g, '')) || (epIdx + 1);
-                episodes.push({
-                    season: seasonIdx + 1,
-                    seasonTitle: seasonTitle,
-                    episode: epNumber,
-                    label: label,
-                    url: href.startsWith('http') ? href : BASE_URL + href
-                });
-            }
+            const label = $(epEl).text().trim();
+            if (!href || !href.includes('watch')) return;
+
+            const epNum = parseInt(label.replace(/\D/g, '')) || (epIdx + 1);
+            episodes.push({
+                season: seasonIdx + 1,
+                episode: epNum,
+                label,
+                url: href.startsWith('http') ? href : BASE_URL + href
+            });
         });
     });
-    
+
     return episodes;
 }
 
-// 5. الدالة الرئيسية
-async function getStreams(imdbId, type, season, episode) {
+// ============================================================
+// 5. استخراج رابط الفيديو من صفحة الحلقة/الفيلم
+// ============================================================
+async function extractVideoUrl(pageUrl) {
+    const { data } = await axios.get(pageUrl, { headers: HEADERS, timeout: 8000 });
+    const $ = cheerio.load(data);
+
+    let src = $('video source').first().attr('src');
+    if (!src) src = $('video').attr('src');
+
+    if (!src) {
+        const match = data.match(/https?:\/\/[^\s"'<>]+\.mp4/);
+        if (match) src = match[0];
+    }
+
+    if (!src) return null;
+    if (src.startsWith('//')) src = 'https:' + src;
+    if (src.startsWith('/')) src = BASE_URL + src;
+    return src;
+}
+
+// ============================================================
+// 6. سحب قائمة العناصر من صفحة قائمة (أفلام أو مسلسلات)
+// ============================================================
+async function scrapeList(listUrl) {
+    const { data } = await axios.get(listUrl, { headers: HEADERS, timeout: 10000 });
+    const $ = cheerio.load(data);
+    const items = [];
+
+    $('.movie-container > div').each((i, el) => {
+        const $el = $(el);
+        const linkEl = $el.find('.movie-title a').first();
+        const href = linkEl.attr('href');
+        const title = linkEl.text().trim();
+        const poster = $el.find('img.lazy').attr('data-src') 
+                    || $el.find('img').attr('src');
+        const episodesText = $el.find('.video_quality .label').text().trim();
+
+        if (!href || !title) return;
+
+        const slug = href.split('/').pop().replace('.html', '').replace(/\?.*/, '');
+
+        items.push({
+            id: 'alooy:' + slug,
+            name: title,
+            poster: poster ? (poster.startsWith('http') ? poster : BASE_URL + poster) : undefined,
+            description: episodesText || undefined
+        });
+    });
+
+    return items;
+}
+
+// ============================================================
+// 7. كتالوج الأفلام والمسلسلات
+// ============================================================
+async function getMovieCatalog() {
+    return await scrapeList(`${BASE_URL}/movies.html`);
+}
+
+async function getSeriesCatalog() {
+    return await scrapeList(`${BASE_URL}/tv-series.html`);
+}
+
+// ============================================================
+// 8. جلب stream من رابط صفحة مباشر (للكتالوج)
+// ============================================================
+async function getStreamsByPageUrl(pageUrl, type, season = 1, episode = 1) {
     try {
-        // الخطوة 1: تحويل IMDb ID إلى عنوان
-        const { title, year } = await imdbToTitle(imdbId);
-        console.log(`🎬 العنوان: ${title} (${year})`);
-
-        // الخطوة 2: البحث في الموقع
-        let results = await searchSite(title);
-        
-        // إذا ما لقينا نتائج، نجرب البحث مع السنة
-        if (results.length === 0) {
-            results = await searchSite(`${title} ${year}`);
-        }
-        
-        if (results.length === 0) {
-            console.log('❌ ما لقيت نتائج في الموقع');
-            return [];
-        }
-
-        console.log(`✅ لقيت ${results.length} نتيجة`);
-        const match = results[0];
-        const pageUrl = match.url;
-        console.log(`🔗 رابط الصفحة: ${pageUrl}`);
-
-        // الخطوة 3: إذا كان مسلسل، نستخرج الحلقات
-        if (type === 'series' || match.type === 'TV-Series') {
+        if (type === 'series') {
             const episodes = await extractEpisodes(pageUrl);
-            console.log(`📺 عدد الحلقات: ${episodes.length}`);
+            console.log(`📺 ${episodes.length} حلقة`);
 
-            // نبحث عن الحلقة المطلوبة
-            let targetEp = episodes.find(
-                e => e.season === season && e.episode === episode
+            let target = episodes.find(
+                e => e.season === parseInt(season) && e.episode === parseInt(episode)
             );
-            
-            // إذا ما لقيناها بالضبط، ناخذ أول حلقة من الموسم المطلوب
-            if (!targetEp) {
-                targetEp = episodes.find(e => e.season === season) || episodes[0];
-            }
+            if (!target) target = episodes[0];
+            if (!target) return [];
 
-            if (!targetEp) return [];
-
-            console.log(`▶️ الحلقة المستهدفة: ${targetEp.label} (${targetEp.url})`);
-            const videoUrl = await extractVideoUrl(targetEp.url);
-
+            const videoUrl = await extractVideoUrl(target.url);
             if (!videoUrl) return [];
 
             return [{
-                title: `AlooyTV | ${match.title} | ${targetEp.label}`,
+                title: `AlooyTV | ${target.label}`,
                 url: videoUrl,
                 quality: 'HD'
             }];
+        } else {
+            const videoUrl = await extractVideoUrl(pageUrl);
+            if (!videoUrl) return [];
+            return [{ title: 'AlooyTV', url: videoUrl, quality: 'HD' }];
+        }
+    } catch (e) {
+        console.error('❌ خطأ في getStreamsByPageUrl:', e.message);
+        return [];
+    }
+}
+
+// ============================================================
+// 9. الدالة الرئيسية للـ stream
+// ============================================================
+async function getStreams(imdbId, type, season = 1, episode = 1) {
+    // إذا كان ID من كتالوجنا
+    if (imdbId.startsWith('alooy:')) {
+        const slug = imdbId.replace('alooy:', '');
+        const pageUrl = `${BASE_URL}/watch/${slug}.html`;
+        return await getStreamsByPageUrl(pageUrl, type, season, episode);
+    }
+
+    // إذا كان IMDb ID عادي
+    try {
+        const results = await findContent(imdbId, type);
+        if (results.length === 0) return [];
+
+        const streams = [];
+
+        for (const match of results.slice(0, 3)) {
+            try {
+                const pageUrl = match.url;
+                console.log(`📄 جرب: ${match.title} → ${pageUrl}`);
+
+                if (type === 'series') {
+                    const episodes = await extractEpisodes(pageUrl);
+                    let target = episodes.find(
+                        e => e.season === parseInt(season) && e.episode === parseInt(episode)
+                    );
+                    if (!target) target = episodes[0];
+                    if (!target) continue;
+
+                    const videoUrl = await extractVideoUrl(target.url);
+                    if (!videoUrl) continue;
+
+                    streams.push({
+                        title: `AlooyTV | ${match.title} | ${target.label}`,
+                        url: videoUrl,
+                        quality: 'HD'
+                    });
+                } else {
+                    const videoUrl = await extractVideoUrl(pageUrl);
+                    if (!videoUrl) continue;
+
+                    streams.push({
+                        title: `AlooyTV | ${match.title}`,
+                        url: videoUrl,
+                        quality: 'HD'
+                    });
+                }
+
+                if (streams.length > 0) break;
+            } catch (e) {
+                console.log(`⚠️ ${match.url}: ${e.message}`);
+            }
         }
 
-        // الخطوة 4: إذا كان فيلم، نستخرج رابط الفيديو مباشرة
-        const videoUrl = await extractVideoUrl(pageUrl);
-        if (!videoUrl) return [];
-
-        return [{
-            title: `AlooyTV | ${match.title}`,
-            url: videoUrl,
-            quality: 'HD'
-        }];
-
+        return streams;
     } catch (error) {
         console.error('❌ خطأ:', error.message);
         return [];
     }
 }
 
-module.exports = { getStreams };
+module.exports = {
+    getStreams,
+    getStreamsByPageUrl,
+    getMovieCatalog,
+    getSeriesCatalog
+};
