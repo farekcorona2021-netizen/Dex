@@ -1,10 +1,13 @@
 {
   "id": "org.alooytv.addon",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "name": "AlooyTV",
-  "description": "سكرابر لمشاهدة الأفلام والمسلسلات من AlooyTV",
+  "description": "أفلام ومسلسلات من AlooyTV مباشرة",
   "types": ["movie", "series"],
-  "catalogs": [],
-  "resources": ["stream"],
-  "idPrefixes": ["tt"]
+  "catalogs": [
+    { "type": "movie", "id": "alooy-movies", "name": "🎥 أفلام AlooyTV" },
+    { "type": "series", "id": "alooy-series", "name": "📺 مسلسلات AlooyTV" }
+  ],
+  "resources": ["catalog", "stream"],
+  "idPrefixes": ["alooy:", "tt"]
 }
