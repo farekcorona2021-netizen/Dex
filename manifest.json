@@ -1,0 +1,10 @@
+{
+  "id": "org.alooytv.addon",
+  "version": "1.0.0",
+  "name": "AlooyTV",
+  "description": "سكرابر لمشاهدة الأفلام والمسلسلات من AlooyTV",
+  "types": ["movie", "series"],
+  "catalogs": [],
+  "resources": ["stream"],
+  "idPrefixes": ["tt"]
+}
